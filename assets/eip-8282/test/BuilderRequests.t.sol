@@ -171,8 +171,9 @@ contract BuilderDepositTest is RequestContractTest {
     bytes32 constant wc = 0x0300000000000000000000001111111111111111111111111111111111111111;
 
     function setUp() public {
-        etchInhibited(0x0000000000000000000000000000000000007732, "src/deposits/main.eas");
-        getRequests(); // activation system call clears the inhibitor
+        // No activation: builder deposits are accepted from deployment.
+        vm.etch(0x0000000000000000000000000000000000007732, Geas.compile("src/deposits/main.eas"));
+        addr = 0x0000000000000000000000000000000000007732;
     }
 
     function makeDeposit(bytes memory pubkey, uint64 amount) internal pure returns (bytes memory) {
@@ -355,21 +356,19 @@ contract BuilderDepositTest is RequestContractTest {
         assertEq(fee(), 1, "fee returns to the minimum once the queue is empty");
     }
 
-    function testInhibitorBlocksRequestsUntilFirstSystemCall() public {
-        // A freshly deployed (not yet activated) instance.
-        etchInhibited(0x0000000000000000000000000000000000007734, "src/deposits/main.eas");
-        vm.deal(address(this), 2 ether);
+    function testDepositsAllowedBeforeActivation() public {
+        // setUp only etched the code; no system call has run. With the pre-fork
+        // inhibitor removed, the fee getter works and a deposit succeeds before
+        // the fork (builders may register early).
+        assertEq(fee(), 1, "fee getter should work before any system call");
 
-        (bool ok,) = addr.call("");
-        assertEq(ok ? 1 : 0, 0, "fee getter must revert while inhibited");
+        bytes memory input = makeDeposit(pattern(0xAA, 48), min_amount);
+        addDeposit(input, uint256(min_amount) * 1 gwei + fee());
+        assertStorage(queue_tail_slot, 1, "pre-fork deposit should enqueue");
 
-        (ok,) = addr.call{value: 1 ether + 1}(makeDeposit(pattern(0xAA, 48), min_amount));
-        assertEq(ok ? 1 : 0, 0, "deposit must revert while inhibited");
-
-        // The first system call clears the inhibitor.
-        getRequests();
-        assertStorage(excess_slot, 0, "inhibitor not cleared");
-        assertEq(fee(), 1, "fee should be at minimum after activation");
+        // The queued pre-fork deposit dequeues normally once draining begins.
+        bytes memory req = getRequests();
+        assertEq(req.length, record_size, "queued pre-fork deposit should dequeue");
     }
 
     function testSystemCallDrainsRegardlessOfCalldata() public {
