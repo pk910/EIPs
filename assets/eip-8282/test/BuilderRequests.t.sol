@@ -13,6 +13,7 @@ interface Vm {
     }
 
     function etch(address, bytes calldata) external;
+    function warp(uint256) external;
     function store(address, bytes32, bytes32) external;
     function load(address, bytes32) external view returns (bytes32);
     function prank(address) external;
@@ -156,7 +157,7 @@ abstract contract RequestContractTest {
 /// is the same bytes with the amount little-endian. No on-chain BLS: the
 /// signature is opaque calldata for the consensus layer to verify on dequeue.
 contract BuilderDepositTest is RequestContractTest {
-    uint256 constant record_size = 184;
+    uint256 constant record_size = 192; // 184-byte input + 8-byte enqueue timestamp
     uint64 constant min_amount = 1_000_000_000; // 1 ETH in gwei
     bytes32 constant wc = 0x0300000000000000000000001111111111111111111111111111111111111111;
 
@@ -169,13 +170,24 @@ contract BuilderDepositTest is RequestContractTest {
         return abi.encodePacked(pubkey, wc, amount, pattern(0xBB, 96));
     }
 
-    // expectedRecord is the input with the amount (bytes 80..88) reversed into
-    // little-endian, as the system call must return it.
-    function expectedRecord(bytes memory input) internal pure returns (bytes memory out) {
+    // leBytes8 encodes a uint64 as 8 little-endian bytes.
+    function leBytes8(uint64 v) internal pure returns (bytes memory out) {
+        out = new bytes(8);
+        for (uint256 i = 0; i < 8; i++) {
+            out[i] = bytes1(uint8(v >> (8 * i)));
+        }
+    }
+
+    // expectedRecord is the 192-byte dequeued record: the input with the amount
+    // (bytes 80..88) reversed into little-endian, plus the 8-byte enqueue
+    // timestamp (little-endian) appended. The timestamp equals block.timestamp
+    // in the test (no warp between the deposit and the read).
+    function expectedRecord(bytes memory input) internal view returns (bytes memory out) {
         out = bytes.concat(input);
         for (uint256 i = 0; i < 8; i++) {
             out[80 + i] = input[87 - i];
         }
+        out = bytes.concat(out, leBytes8(uint64(block.timestamp)));
     }
 
     function addDeposit(bytes memory input, uint256 value) internal {
@@ -291,6 +303,23 @@ contract BuilderDepositTest is RequestContractTest {
         // The queue is reusable after the reset.
         addDeposit(makeDeposit(pattern(0xEE, 48), min_amount), 1 ether + fee());
         assertStorage(queue_tail_slot, 1, "queue not reusable after reset");
+    }
+
+    function testEnqueueTimestampAppended() public {
+        uint64 ts = 0x0000000064abcdef; // a representative unix timestamp
+        vm.warp(ts);
+
+        bytes memory input = makeDeposit(pattern(0xAA, 48), min_amount);
+        addDeposit(input, uint256(min_amount) * 1 gwei + fee());
+
+        bytes memory req = getRequests();
+        assertEq(req.length, record_size, "record must be 192 bytes (input + timestamp)");
+        // The trailing 8 bytes are the enqueue block timestamp, little-endian.
+        assertEq(slice(req, 184, 8), leBytes8(ts), "appended enqueue timestamp mismatch");
+        // The 184-byte body is unchanged.
+        assertEq(slice(req, 0, 80), slice(input, 0, 80), "prefix not verbatim");
+        assertEq(slice(req, 88, 96), slice(input, 88, 96), "signature not verbatim");
+        assertEq(req, expectedRecord(input), "full record mismatch");
     }
 
     function testFeeTracksQueueLength() public {

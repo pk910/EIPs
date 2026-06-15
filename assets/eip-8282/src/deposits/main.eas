@@ -44,9 +44,12 @@
 #define MIN_AMOUNT = 1000000000 ;; minimum deposit amount in gwei (1 ETH, the EIP-7732 builder minimum)
 #define GWEI = 1000000000       ;; wei per gwei
 
-#define INPUT_SIZE = 184   ;; the size of (pubkey ++ withdrawal_credentials ++ amount ++ signature)
-#define RECORD_SIZE = 184  ;; the size of (pubkey ++ withdrawal_credentials ++ amount ++ signature)
-#define SLOTS_PER_ITEM = 6 ;; (pk[0:32], pk[32:48]+wc[0:16], wc[16:32]+amount+sig[0:8], sig[8:40], sig[40:72], sig[72:96])
+#define INPUT_SIZE = 184   ;; submitter input: (pubkey ++ withdrawal_credentials ++ amount ++ signature)
+;; The dequeued record appends an 8-byte enqueue block timestamp (little-endian,
+;; like the amount), fitting the 6th storage slot's previously-zero trailing 8
+;; bytes; no extra storage slot is needed, only the returned record grows.
+#define RECORD_SIZE = 192  ;; INPUT_SIZE + 8-byte enqueue timestamp
+#define SLOTS_PER_ITEM = 6 ;; (pk[0:32], pk[32:48]+wc[0:16], wc[16:32]+amount+sig[0:8], sig[8:40], sig[40:72], sig[72:96]+timestamp)
 
 ;; ----------------------------------------------------------------------------
 ;; PROGRAM START --------------------------------------------------------------
@@ -202,22 +205,26 @@ handle_input:
   push 1                ;; [1, slot, ..]
   add                   ;; [slot, ..]
 
-  ;; Store sig[72:96] to queue. The calldataload reads past the end of the
-  ;; input, so the low 8 bytes are zero.
+  ;; Store sig[72:96] ++ enqueue timestamp to queue. The calldataload reads 8
+  ;; bytes past the 184-byte input, so the low 8 bytes are zero; OR the enqueue
+  ;; block timestamp (a uint64, so it cannot collide with the signature bytes)
+  ;; into them. The read path returns it little-endian (matching the amount).
   push 160              ;; [160, slot, ..]
-  calldataload          ;; [sig[72:96], slot, ..]
-  swap1                 ;; [slot, sig[72:96], ..]
+  calldataload          ;; [sig[72:96], slot, ..]   (low 8 bytes = 0)
+  timestamp             ;; [ts, sig[72:96], slot, ..]
+  or                    ;; [sig[72:96]|ts, slot, ..]
+  swap1                 ;; [slot, sig[72:96]|ts, ..]
   sstore                ;; [..]
 
   ;; Assemble log data: the input verbatim (the amount big-endian, as
-  ;; submitted).
+  ;; submitted). The enqueue event logs only the submitter's input.
   push INPUT_SIZE       ;; [size, ..]
   push 0                ;; [ost, size, ..]
   push 0                ;; [dest, ost, size, ..]
   calldatacopy          ;; [..]
 
-  ;; Log record.
-  push RECORD_SIZE      ;; [size, ..]
+  ;; Log record (the verbatim INPUT_SIZE input).
+  push INPUT_SIZE       ;; [size, ..]
   push 0                ;; [idx, size, ..]
   log0                  ;; [..]
 
@@ -411,17 +418,27 @@ accum_loop:
   push 32               ;; [32, offset, slotbase, ..]
   add                   ;; [offset=offset+160, slotbase, ..]
 
-  ;; Read slot 'sg4' from storage. The low 8 bytes are zero (see the write
-  ;; path), so the word can be stored as-is; the next record (or the return
-  ;; size) overwrites or cuts the trailing zero bytes.
+  ;; Read slot 'sg4' = sig[72:96] (high 24 bytes) ++ enqueue timestamp (low 8
+  ;; bytes, stored big-endian on the write path).
   swap1                 ;; [slotbase, offset, ..]
   push 5                ;; [5, slotbase, offset, ..]
   add                   ;; [slot, offset, ..]
   sload                 ;; [sg4, offset, ..]
 
-  ;; Store sg4 at output offset = i*RECORD_SIZE + 160.
-  swap1                 ;; [offset, sg4, ..]
-  mstore                ;; [..]
+  ;; Store the full sg4 word at output offset = i*RECORD_SIZE + 160 (lays down
+  ;; sig[72:96] and the big-endian timestamp in the trailing 8 bytes).
+  dup1                  ;; [sg4, sg4, offset, ..]
+  dup3                  ;; [offset, sg4, sg4, offset, ..]
+  mstore                ;; [sg4, offset, ..]
+
+  ;; Overwrite the trailing 8 bytes (offset+184) with the timestamp little-endian,
+  ;; matching the SSZ encoding used for the amount.
+  push uint64_mask      ;; [mask, sg4, offset, ..]
+  and                   ;; [ts, offset, ..]
+  swap1                 ;; [offset, ts, ..]
+  push 24               ;; [24, offset, ts, ..]   (160 + 24 = 184)
+  add                   ;; [offset+184, ts, ..]
+  %mstore_uint64_le()   ;; [..]
 
   ;; Increment i.
   push 1                ;; [1, i, ..]
