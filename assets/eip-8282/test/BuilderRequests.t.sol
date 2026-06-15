@@ -62,6 +62,15 @@ abstract contract RequestContractTest {
         return data;
     }
 
+    // getRequestsWithLimit triggers a dequeue as the system address, passing an
+    // explicit 32-byte per-block limit as calldata.
+    function getRequestsWithLimit(uint256 limit) internal returns (bytes memory) {
+        vm.prank(sysaddr);
+        (bool ok, bytes memory data) = addr.call(abi.encode(limit));
+        require(ok, "system call failed");
+        return data;
+    }
+
     // fee calls the fee getter (empty calldata, non-system caller).
     function fee() internal returns (uint256) {
         (bool ok, bytes memory data) = addr.call("");
@@ -371,6 +380,48 @@ contract BuilderDepositTest is RequestContractTest {
         (bool ok, bytes memory data) = addr.call(hex"01");
         require(ok, "system call failed");
         assertEq(data.length, record_size, "system call should drain the queue");
+    }
+
+    function testDynamicDequeueLimit() public {
+        for (uint256 i = 0; i < 20; i++) {
+            addDeposit(makeDistinctDeposit(i), uint256(amountFor(i)) * 1 gwei + fee());
+        }
+
+        // A system call with an explicit limit drains exactly that many, oldest first.
+        bytes memory req = getRequestsWithLimit(5);
+        assertEq(req.length, 5 * record_size, "should drain exactly the requested limit");
+        assertStorage(queue_head_slot, 5, "head should advance by the limit");
+
+        // A different limit on the next block drains that many.
+        req = getRequestsWithLimit(3);
+        assertEq(req.length, 3 * record_size, "should drain the next requested limit");
+        assertStorage(queue_head_slot, 8, "head should advance again");
+
+        // A limit larger than the remaining queue drains only what is left (12),
+        // and the queue resets once fully drained.
+        req = getRequestsWithLimit(1000);
+        assertEq(req.length, 12 * record_size, "should drain only the remaining records");
+        assertStorage(queue_head_slot, 0, "queue should reset when fully drained");
+        assertStorage(queue_tail_slot, 0, "tail should reset when fully drained");
+    }
+
+    function testDequeueLimitClampedToHardMax() public {
+        for (uint256 i = 0; i < 3; i++) {
+            addDeposit(makeDistinctDeposit(i), uint256(amountFor(i)) * 1 gwei + fee());
+        }
+        // A limit far above HARD_MAX_PER_BLOCK must clamp (not revert/overflow)
+        // and drain only the available records.
+        bytes memory req = getRequestsWithLimit(type(uint256).max);
+        assertEq(req.length, 3 * record_size, "huge limit must clamp and drain available only");
+    }
+
+    function testDefaultDequeueLimitWithoutCalldata() public {
+        for (uint256 i = 0; i < max_per_block + 1; i++) {
+            addDeposit(makeDistinctDeposit(i), uint256(amountFor(i)) * 1 gwei + fee());
+        }
+        // Empty calldata falls back to the default MAX_PER_BLOCK cap.
+        bytes memory req = getRequests();
+        assertEq(req.length, max_per_block * record_size, "empty calldata must use the default cap");
     }
 
     receive() external payable {}

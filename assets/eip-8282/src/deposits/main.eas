@@ -37,7 +37,8 @@
 #define QUEUE_OFFSET = 4
 
 #define MIN_FEE = 1
-#define MAX_PER_BLOCK = 16
+#define MAX_PER_BLOCK = 16        ;; default per-block dequeue limit (used when the system call passes no limit)
+#define HARD_MAX_PER_BLOCK = 8192 ;; absolute ceiling the system-call-supplied limit is clamped to
 #define FEE_UPDATE_FRACTION = 17
 #define EXCESS_INHIBITOR = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 
@@ -240,11 +241,11 @@ handle_input:
 ;; SYSTEM SUBROUTINE ----------------------------------------------------------
 ;; ----------------------------------------------------------------------------
 ;;
-;; Pop request from queue, update fee accumulator ~~ This is the logic executed
-;; by the protocol each block. It reads as many requests as available from the
-;; queue, until the max request per block is reached. The requests are returned
-;; as a contiguous array of bytes with each record being exactly RECORD_SIZE
-;; bytes.
+;; Pop requests from the queue. This is the logic executed by the protocol each
+;; block. It reads as many requests as available from the queue, up to a
+;; per-block limit supplied by the system call (clamped to HARD_MAX_PER_BLOCK),
+;; or MAX_PER_BLOCK when no limit is supplied. The requests are returned as a
+;; contiguous array of bytes with each record being exactly RECORD_SIZE bytes.
 ;;
 ;;  Deposit request record:
 ;;
@@ -260,30 +261,62 @@ handle_input:
 ;; is some shuffling to align the data.
 ;;
 ;; After reading the requests, they are removed from the queue by modifying the
-;; queue's head index. The excess requests accumulator is updated so that the
-;; new cost of submitting a request is reflected. Finally, the request count is
-;; reset.
+;; queue's head index.
 read_requests:
-  ;; Determine the size of the queue by calculating tail - head.
-  push QUEUE_TAIL       ;; [tail_idx_slot]
-  sload                 ;; [tail_idx]
-  push QUEUE_HEAD       ;; [head_idx_slot, tail_idx]
-  sload                 ;; [head_idx, tail_idx]
+  ;; Determine the per-block dequeue limit. The end-of-block system call MAY pass
+  ;; a 32-byte limit as calldata; otherwise the default MAX_PER_BLOCK is used.
+  ;; The supplied limit is clamped to HARD_MAX_PER_BLOCK so a block can never be
+  ;; asked to drain (and the consensus layer to verify) an unbounded number of
+  ;; records.
+  push 32               ;; [32]
+  calldatasize          ;; [cds, 32]
+  lt                    ;; [cds < 32]
+  jumpi @default_limit  ;; []
 
-  ;; Now compute the count.
-  dup1                  ;; [head_idx, head_idx, tail_idx]
-  dup3                  ;; [tail_idx, head_idx, head_idx, tail_idx]
-  sub                   ;; [count, head_idx, tail_idx]
+  push 0                ;; [0]
+  calldataload          ;; [cd_limit]
+  dup1                  ;; [cd_limit, cd_limit]
+  push HARD_MAX_PER_BLOCK ;; [hard_max, cd_limit, cd_limit]
+  lt                    ;; [hard_max < cd_limit, cd_limit]
+  jumpi @clamp_limit    ;; [cd_limit]
+  jump @have_limit      ;; [cd_limit]
 
-  ;; Determine if count is greater than the max requests.
-  dup1                  ;; [count, count, head_idx, tail_idx]
-  push MAX_PER_BLOCK    ;; [reqs_per_block, count, count, head_idx, tail_idx]
-  gt                    ;; [reqs_per_block > count, count, head_idx, tail_idx]
-  jumpi @begin_loop     ;; [count, head_idx, tail_idx]
+clamp_limit:
+  pop                   ;; []
+  push HARD_MAX_PER_BLOCK ;; [hard_max]
+  jump @have_limit      ;; [limit]
 
-  ;; Discard count, use the max requests per block.
-  pop                   ;; [head_idx, tail_idx]
-  push MAX_PER_BLOCK    ;; [count, head_idx, tail_idx]
+default_limit:
+  push MAX_PER_BLOCK    ;; [limit]
+
+have_limit:
+  ;; [limit] -- drain min(tail - head, limit) records, oldest first.
+  push QUEUE_HEAD       ;; [head_slot, limit]
+  sload                 ;; [head, limit]
+  push QUEUE_TAIL       ;; [tail_slot, head, limit]
+  sload                 ;; [tail, head, limit]
+
+  ;; count = tail - head
+  dup2                  ;; [head, tail, head, limit]
+  dup2                  ;; [tail, head, tail, head, limit]
+  sub                   ;; [count, tail, head, limit]
+
+  ;; drain = min(count, limit)
+  dup4                  ;; [limit, count, tail, head, limit]
+  dup2                  ;; [count, limit, count, tail, head, limit]
+  gt                    ;; [count > limit, count, tail, head, limit]
+  jumpi @drain_limit    ;; [count, tail, head, limit]
+
+  ;; count <= limit: drain the whole queue. Produce [count, head_idx, tail_idx].
+  swap3                 ;; [limit, tail, head, count]
+  pop                   ;; [tail, head, count]
+  swap2                 ;; [count, head, tail]
+  jump @begin_loop
+
+drain_limit:
+  ;; count > limit: drain exactly the limit. Produce [limit, head_idx, tail_idx].
+  pop                   ;; [tail, head, limit]
+  swap2                 ;; [limit, head, tail]
 
 begin_loop:
   push 0                ;; [i, count, head_idx, tail_idx]
