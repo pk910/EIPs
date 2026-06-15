@@ -191,15 +191,13 @@ contract BuilderDepositTest is RequestContractTest {
         vm.recordLogs();
         addDeposit(input, value);
         expectLog(input); // the log carries the input verbatim (amount big-endian)
-        assertStorage(count_slot, 1, "unexpected request count");
 
         bytes memory req = getRequests();
         assertEq(req.length, record_size, "unexpected request_data length");
         assertEq(req, expectedRecord(input), "unexpected record");
-        assertStorage(count_slot, 0, "count not reset");
         assertStorage(queue_head_slot, 0, "head not reset");
         assertStorage(queue_tail_slot, 0, "tail not reset");
-        assertEq(fee(), 1, "fee should remain at minimum below target");
+        assertEq(fee(), 1, "fee should return to minimum once the queue is empty");
     }
 
     function testDepositAmountConvertedToLittleEndian() public {
@@ -232,12 +230,12 @@ contract BuilderDepositTest is RequestContractTest {
         // value == 0 fails the fee check itself.
         (ok,) = addr.call{value: 0}(input);
         assertEq(ok ? 1 : 0, 0, "expected zero value to revert");
-        assertStorage(count_slot, 0, "nothing should be enqueued");
+        assertStorage(queue_tail_slot, 0, "nothing should be enqueued");
 
         // value == stake + fee succeeds.
         (ok,) = addr.call{value: 1 ether + 1}(input);
         assertEq(ok ? 1 : 0, 1, "expected exact stake + fee to succeed");
-        assertStorage(count_slot, 1, "expected one request");
+        assertStorage(queue_tail_slot, 1, "expected one queued request");
     }
 
     function testDepositRejectsBadInputSize() public {
@@ -270,9 +268,9 @@ contract BuilderDepositTest is RequestContractTest {
         // Enqueue one more deposit than the per-block cap.
         for (uint256 i = 0; i < max_per_block + 1; i++) {
             inputs[i] = makeDistinctDeposit(i);
-            addDeposit(inputs[i], uint256(amountFor(i)) * 1 gwei + 1);
+            // Pay the live per-tx fee, which rises with the growing queue length.
+            addDeposit(inputs[i], uint256(amountFor(i)) * 1 gwei + fee());
         }
-        assertStorage(count_slot, max_per_block + 1, "unexpected request count");
 
         // First system read drains exactly the cap, FIFO.
         bytes memory req = getRequests();
@@ -282,7 +280,6 @@ contract BuilderDepositTest is RequestContractTest {
         }
         assertStorage(queue_head_slot, max_per_block, "unexpected head");
         assertStorage(queue_tail_slot, max_per_block + 1, "unexpected tail");
-        assertStorage(excess_slot, max_per_block + 1 - target_per_block, "unexpected excess");
 
         // Second read returns the remainder and resets the queue.
         req = getRequests();
@@ -296,21 +293,28 @@ contract BuilderDepositTest is RequestContractTest {
         assertStorage(queue_tail_slot, 1, "queue not reusable after reset");
     }
 
-    function testFeeMatchesFakeExponentialAndDecays() public {
-        for (uint256 i = 0; i < 18; i++) {
-            addDeposit(makeDeposit(pattern(uint8(i + 1), 48), min_amount), 1 ether + 1);
-        }
-        getRequests();
-        // excess = 0 + 18 - 2 = 16
-        assertStorage(excess_slot, 16, "unexpected excess");
-        assertEq(fee(), fakeExponential(1, 16, 17), "fee does not match curve");
+    function testFeeTracksQueueLength() public {
+        // The fee is computed per-tx as fakeExponential(MIN_FEE, queue_length, 17)
+        // where queue_length = tail - head at the moment of the call.
+        assertEq(fee(), fakeExponential(1, 0, 17), "empty-queue fee should be the minimum");
+        assertEq(fee(), 1, "empty-queue fee should be 1 wei");
 
-        // With no new requests, each system call decays excess by the target.
-        getRequests();
-        getRequests(); // drains the 2 remaining records
-        assertStorage(excess_slot, 12, "excess should decay by target per block");
-        getRequests();
-        assertStorage(excess_slot, 10, "excess should keep decaying");
+        // Each enqueued deposit raises the queue length and the fee tracks it
+        // exactly, with no system call in between.
+        for (uint256 i = 0; i < 20; i++) {
+            assertEq(fee(), fakeExponential(1, i, 17), "fee must equal fakeExponential(1, qlen, 17)");
+            addDeposit(makeDeposit(pattern(uint8(i + 1), 48), min_amount), uint256(min_amount) * 1 gwei + fee());
+        }
+        assertEq(load(queue_tail_slot) - load(queue_head_slot), 20, "unexpected queue length");
+        assertEq(fee(), fakeExponential(1, 20, 17), "fee must reflect the full backlog");
+
+        // Draining lowers the queue length, so the fee falls.
+        getRequests(); // drains up to the cap (16), leaving 4
+        assertEq(load(queue_tail_slot) - load(queue_head_slot), 20 - max_per_block, "unexpected remaining queue");
+        assertEq(fee(), fakeExponential(1, 20 - max_per_block, 17), "fee must fall with the queue");
+
+        getRequests(); // drains the remaining 4; the queue empties and resets
+        assertEq(fee(), 1, "fee returns to the minimum once the queue is empty");
     }
 
     function testInhibitorBlocksRequestsUntilFirstSystemCall() public {
